@@ -1,0 +1,4 @@
+DELAY 2500
+GUI ENTER
+DELAY 1500
+STRINGLN firefox --new-window "https://www.youtube.com/watch?v=dQw4w9WgXcQ"

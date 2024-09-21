@@ -1,0 +1,715 @@
+#!/usr/bin/python
+from py_bevy import App, Schedule
+import pygame
+# from pygame.constants import SCALED
+# import pyee
+from enum import Enum
+from logging import DEBUG, INFO
+from dataclasses import dataclass as component
+from pathlib import Path
+from functools import partial
+from textwrap import fill as textwrap_fill
+from copy import deepcopy
+from os import listdir
+from ducky_interpreter import DuckyExec
+
+
+_FRAME = 0
+_FPS = 0.0
+THIS_DIR = Path(__file__)
+THIS_DIR = THIS_DIR.parent.absolute()
+SCREEN_WIDTH = 1280
+SCREEN_HEIGHT = 720
+SCREEN_SIZE = (SCREEN_WIDTH, SCREEN_HEIGHT)
+X_BORDER = 60
+Y_BORDER = 20  # 30
+HIGHLIGHT_BORDERS = 20  # 30
+
+
+class States(Enum):
+    STARTUP = 0
+    SELECT_COM_PORT = 1
+    SELECT_SCRIPT = 2
+    CONFIRM_SCRIPT = 3
+    MONITOR_SCRIPT = 4
+    SCRIPT_COMPLETE = 5
+    EXIT = 6
+
+
+app = App(States.STARTUP, DEBUG)
+
+
+class ResourceID(Enum):
+    BG_COLOR = 0
+    TEXT_COLOR = 1
+    SCREEN = 2
+    FONT = 3
+    TO_RENDER = 4
+    CLOCK = 5
+    PG_EVENTS = 6
+    HIGHLIGHT_COLOR = 7
+    ROW_SIZE = 8
+    HIGHLIGHT_SIZE = 9
+    # CHAR_SIZE = 10
+    CONTROLLER = 11
+    KEY_SCAN = 12
+    LAST_KEY_SCAN = 13
+    FONT_2 = 14
+    EXECUTER = 15
+    SERIAL_PORTS = 16
+    PORT_SELECT_BOX = 17
+    SELECTED_PORT = 18
+    SCRIPTS = 19
+    SCRIPTS_I = 20
+    SCRIPT_NAMES_BOX = 21
+    SCRIPT_DOCS_BOX = 22
+    EXEC = 23
+    EXEC_THREAD = 24
+
+
+class Buttons(Enum):
+    UP = 0
+    DOWN = 1
+    LEFT = 2
+    RIGHT = 3
+    A = 4
+    B = 5
+    X = 6
+    Y = 7
+    START = 8
+    SELECT = 9
+    L_BUMP = 10
+    R_BUMP = 11
+    L_TRIG = 12
+    R_TRIG = 13
+
+
+@component
+class BoundingBox:
+    x_min = 0.0
+    y_min = 0.0
+    x_max = 0.0
+    y_max = 0.0
+
+
+@component
+class DuckyScript:
+    def __init__(self, script_dir):
+        files = list(Path(script_dir).iterdir())
+        # print(files)
+        self.script = [f for f in files if f.name.endswith(
+            ".dd") or f.name.endswith(".txt")][0]
+        self.docs_f = [f for f in files if f.name.endswith(
+            ".md")][0]
+        # print("script name", self.script)
+        with open(self.docs_f, "r") as f:
+            self.docs = f.readlines()
+
+
+class DuckyExecThread:
+    def __init__(self, serial_path, script):
+        self.port = serial_path
+        self.script = script
+        self.executor = DuckyExec(serial_path)
+        # self.lock = threading.Lock()
+        self.complete = False
+        self.total_lines = 0
+
+    def exec(self):
+        # with self.lock:
+        with open(self.script, "r") as code_f:
+            code = code_f.read()
+            self.total_lines = code.count("\n")
+            # print("total lines", self.total_lines)
+            # print(code)
+            # try:
+            self.executor.exec_script(code)
+            # except Exception as e:
+            # print(e)
+            print("complete")
+            self.complete = True
+
+    def get_line(self):
+        # with self.lock:
+        return self.executor.get_line()
+
+    def done(self):
+        # with self.lock:
+        return self.complete
+
+
+def up_pressed(app):
+    return Buttons.UP in app.resources[ResourceID.KEY_SCAN]
+
+
+def down_pressed(app):
+    return Buttons.DOWN in app.resources[ResourceID.KEY_SCAN]
+
+
+def left_pressed(app):
+    return Buttons.LEFT in app.resources[ResourceID.KEY_SCAN]
+
+
+def right_pressed(app):
+    return Buttons.RIGHT in app.resources[ResourceID.KEY_SCAN]
+
+
+def draw_text(app: App, x: float, y: float, arg: str, center_x=False):
+    font = app.resources.get(ResourceID.FONT)
+    text = font.render(
+        arg, True, app.resources[ResourceID.TEXT_COLOR])
+    textRect = text.get_rect()
+
+    textRect.center = (x, y)
+
+    if not center_x:
+        textRect.left = x
+
+    app.resources[ResourceID.TO_RENDER].append((text, textRect))
+
+
+def draw_pbar(app: App, x: float, y: float, arg: str):
+    font = app.resources.get(ResourceID.FONT_2)
+    text = font.render(
+        arg, True, app.resources[ResourceID.TEXT_COLOR])
+    textRect = text.get_rect()
+
+    textRect.center = (x, y)
+    textRect.size = (SCREEN_SIZE)
+
+    app.resources[ResourceID.TO_RENDER].append((text, textRect))
+
+    return textRect
+
+
+def font_size(app: App, string="M"):
+    return app.resources.get(ResourceID.FONT_2).size(string)
+
+
+@app.register(States.STARTUP, Schedule.ENTER)
+def init_setup(app: App):
+    init(app)
+
+
+@app.register(States.STARTUP, Schedule.UPDATE)
+def switch(app: App):
+    app.set_next_state(States.SELECT_COM_PORT)
+
+
+@app.register(States.STARTUP, Schedule.EXIT)
+def log_exit_setup(app: App):
+    app.log.log(f"leaving state {app._state.state}")
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def display_fps(app: App):
+    global _FPS
+    global _FRAME
+
+    if not _FRAME % 20:
+        fps = f"{round(app.resources[ResourceID.CLOCK].get_fps(), 2)}"
+
+        if len(fps) > 3:
+            # while len(fps.split(".")[0]) < 3:
+            while fps[3] != "." and len(fps) < 6:
+                fps = f" {fps}"
+
+        font = app.resources[ResourceID.FONT]
+        text = font.render(
+            fps, True, app.resources[ResourceID.TEXT_COLOR])
+        text_rect = text.get_rect()
+
+        # used uppercase "M" to figure out max char width even if using non-monospaced font
+        text_rect.top = SCREEN_HEIGHT - font.size("M")[1]
+        text_rect.left = 0
+
+        _FPS = (text, text_rect)
+
+    _FRAME += 1
+    app.resources[ResourceID.TO_RENDER].append(_FPS)
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.ENTER)
+def bounding_boxes(app: App):
+    """defines the bounds of the different boxes"""
+    box = BoundingBox()
+    box.x_min = X_BORDER
+    box.x_max = SCREEN_WIDTH - X_BORDER
+    box.y_min = Y_BORDER
+    box.y_max = SCREEN_HEIGHT - Y_BORDER
+    app.resources[ResourceID.PORT_SELECT_BOX] = box
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def register_ports(app: App):
+    ports = [f"/dev/{f}" for f in listdir("/dev/") if f.startswith(
+        "ttyACM") or f.startswith("ttyUSB")]
+    # app.log.debug(ports)
+    app.resources[ResourceID.SERIAL_PORTS] = ports
+
+    if not app.resources.get(ResourceID.SELECTED_PORT) and len(ports):
+        app.resources[ResourceID.SELECTED_PORT] = ports[0]
+
+
+# @app.register(States.MONITOR_CMD, Schedule.UPDATE)
+# @app.register(States.SET_TARGET, Schedule.UPDATE)
+# @app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def controls_step(app: App):
+    events = app.resources[ResourceID.PG_EVENTS]
+    # last_scan = app.resources[ResourceID.LAST_KEY_SCAN]
+    # print(last_scan, Buttons.SELECT in last_scan)
+    # if Buttons.SELECT in last_scan:
+    #     # print("SELECT")
+    #     app.resources[ResourceID.KEY_SCAN].append(Buttons.SELECT)
+
+    for event in events:
+        if event.type == pygame.JOYHATMOTION and event.value == (0, 1):
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.UP)
+        elif event.type == pygame.JOYHATMOTION and event.value == (0, -1):
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.DOWN)
+        elif event.type == pygame.JOYHATMOTION and event.value == (-1, 0):
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.LEFT)
+        elif event.type == pygame.JOYHATMOTION and event.value == (1, 0):
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.RIGHT)
+        # elif event.type == pygame.JOYHATMOTION and event.value == (1, 0):
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.RIGHT)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 1:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.A)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 0:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.B)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 3:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.X)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 4:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.Y)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 7:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.START)
+        elif event.type == pygame.JOYBUTTONDOWN and event.button == 6:
+            # print("SELECT")
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.SELECT)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 6:
+            # print("RM")
+            app.resources[ResourceID.KEY_SCAN] = [
+                button for button in app.resources[ResourceID.KEY_SCAN] if button != Buttons.SELECT]
+        elif event.type == pygame.JOYBUTTONUP and event.button == 4:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.L_BUMP)
+        elif event.type == pygame.JOYBUTTONUP and event.button == 4:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.R_BUMP)
+        elif event.type == pygame.JOYAXISMOTION and event.axis == 4 and event.value < 0.5:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.L_TRIG)
+        elif event.type == pygame.JOYAXISMOTION and event.axis == 5 and event.value < 0.5:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.R_TRIG)
+
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.UP)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.DOWN)
+            # print("DOWN")
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.LEFT)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.RIGHT)
+        # elif event.type == pygame.KEYDOWN and event.value == (1, 0):
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.RIGHT)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_x:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.A)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_z:
+            app.resources[ResourceID.KEY_SCAN].append(Buttons.B)
+        # elif event.type == pygame.KEYDOWN and event.button == 3:
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.X)
+        # elif event.type == pygame.KEYDOWN and event.button == 4:
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.Y)
+        # elif event.type == pygame.KEYDOWN and event.button == 7:
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.START)
+        # elif event.type == pygame.KEYDOWN and event.button == 6:
+        #     # print("SELECT")
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.SELECT)
+        # elif event.type == pygame.KEYDOWN and event.button == 4:
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.L_BUMP)
+        # elif event.type == pygame.KEYDOWN and event.button == 4:
+        #     app.resources[ResourceID.KEY_SCAN].append(Buttons.R_BUMP)
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def nav_serial_ports(app: App):
+    if app.resources.get(ResourceID.SELECTED_PORT) is None:
+        return
+
+    ports = app.resources.get(ResourceID.SERIAL_PORTS)
+    selected = app.resources.get(ResourceID.SELECTED_PORT)
+    selected = selected if selected else ports[0]
+
+    try:
+        sel_i = ports.index(selected)
+    except ValueError:
+        app.resources[ResourceID.SELECTED_PORT] = None
+        return
+
+    if up_pressed(app):
+        sel_i = (sel_i - 1) % len(ports)
+        app.resources[ResourceID.SELECTED_PORT] = ports[sel_i]
+    elif down_pressed(app):
+        sel_i = (sel_i + 1) % len(ports)
+        app.resources[ResourceID.SELECTED_PORT] = ports[sel_i]
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def highlight_serial_ports(app: App):
+    selected = str(app.resources.get(ResourceID.SELECTED_PORT))
+    screen = app.resources.get(ResourceID.SCREEN)
+
+    hl_size = list(font_size(app, string=selected))
+    hl_size[0] += HIGHLIGHT_BORDERS * 2
+    hl_size[1] += HIGHLIGHT_BORDERS
+
+    rect = pygame.Rect((1, 1), hl_size)
+
+    rect.center = (SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
+
+    pygame.draw.rect(screen, app.resources[ResourceID.HIGHLIGHT_COLOR], rect)
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def render_serial_ports(app: App):
+    if app.resources.get(ResourceID.SELECTED_PORT) is not None:
+        ports = app.resources.get(ResourceID.SERIAL_PORTS)
+        # [ports.append(str(i)) for i in range(25)]
+        selected = app.resources.get(ResourceID.SELECTED_PORT)
+        box = app.resources.get(ResourceID.PORT_SELECT_BOX)
+
+        selected = selected if selected else ports[0]
+        char_size = font_size(app)
+        try:
+            sel_i = ports.index(selected)
+        except ValueError:
+            app.resources[ResourceID.SELECTED_PORT] = None
+            return
+
+        box_h = box.y_max - box.y_min
+        n_lines = box_h // int(char_size[1] * 1.5) - 1
+        mid_horiz = (box.x_max + box.x_min) / 2
+        line_h = box_h / n_lines
+
+        if len(ports) < n_lines:
+            n_renders = len(ports)
+        else:
+            n_renders = n_lines - 1
+
+        on_screen = [ports[(sel_i + i) % n_renders] for i in range(n_renders)]
+        display = partial(draw_text, app, mid_horiz, center_x=True)
+        # display(mid_vert, on_screen[0])
+
+        for i, port in enumerate(on_screen):
+            if i < n_lines / 2:
+                y = (box.y_max - box_h / 2) + (line_h * i)
+            else:
+                y = box.y_min + line_h + (line_h * (i - n_lines // 2))
+
+            display(y, port)
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def render_no_serial_ports(app: App):
+    if app.resources.get(ResourceID.SELECTED_PORT) is None:
+        display = partial(draw_text, app, SCREEN_WIDTH / 2, center_x=True)
+        display(SCREEN_HEIGHT / 2, "No serial ports available")
+
+
+@app.register(States.SELECT_COM_PORT, Schedule.UPDATE)
+def select_serial_port(app: App):
+    if Buttons.A in app.resources.get(ResourceID.KEY_SCAN) and app.resources.get(ResourceID.SELECTED_PORT) is not None:
+        app.set_next_state(States.SELECT_SCRIPT)
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.ENTER)
+def scripts_bounding_boxes(app: App):
+    """defines the bounds of the different boxes"""
+    names_box = BoundingBox()
+    names_box.x_min = X_BORDER
+    names_box.x_max = ((SCREEN_WIDTH - X_BORDER * 2) / 4) + names_box.x_min
+    names_box.y_min = Y_BORDER
+    names_box.y_max = SCREEN_HEIGHT - Y_BORDER
+    app.resources[ResourceID.SCRIPT_NAMES_BOX] = names_box
+
+    docs_box = BoundingBox()
+    docs_box.x_min = names_box.x_max
+    docs_box.x_max = SCREEN_WIDTH - X_BORDER
+    docs_box.y_min = Y_BORDER
+    docs_box.y_max = SCREEN_HEIGHT - Y_BORDER
+    app.resources[ResourceID.SCRIPT_DOCS_BOX] = docs_box
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.UPDATE)
+def return_to_com_port_select(app: App):
+    if Buttons.B in app.resources.get(ResourceID.KEY_SCAN):
+        app.set_next_state(States.SELECT_COM_PORT)
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.ENTER)
+def resgister_ducky_scripts(app: App):
+    scripts_dir = f"{THIS_DIR}/scripts"
+    scripts_dirs = [f for f in Path(scripts_dir).iterdir() if f.is_dir()]
+
+    app.resources[ResourceID.SCRIPTS] = {
+        dir_name.name: DuckyScript(dir_name) for dir_name in scripts_dirs}
+
+    if app.resources.get(ResourceID.SCRIPTS_I) is None:
+        app.resources[ResourceID.SCRIPTS_I] = 0
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.UPDATE)
+def select_ducky_names(app: App):
+    scripts = list(app.resources.get(ResourceID.SCRIPTS).keys())
+    # print("scripts", scripts)
+    # scripts_i = app.resources.get(ResourceID.SCRIPTS_I)
+    box = app.resources.get(ResourceID.SCRIPT_NAMES_BOX)
+
+    # selected = selected if selected else ports[0]
+    char_size = font_size(app)
+    sel_i = app.resources.get(ResourceID.SCRIPTS_I)
+
+    box_h = box.y_max - box.y_min
+    n_lines = box_h // int(char_size[1] * 1.5) - 1
+    mid_horiz = (box.x_max + box.x_min) / 2
+    line_h = box_h / n_lines
+
+    if len(scripts) < n_lines:
+        n_renders = len(scripts)
+    else:
+        n_renders = n_lines - 1
+
+    on_screen = [scripts[(sel_i + i) % n_renders] for i in range(n_renders)]
+    display = partial(draw_text, app, mid_horiz, center_x=True)
+    # display(mid_vert, on_screen[0])
+
+    for i, port in enumerate(on_screen):
+        if i < n_lines / 2:
+            y = (box.y_max - box_h / 2) + (line_h * i)
+        else:
+            y = box.y_min + line_h + (line_h * (i - n_lines // 2))
+
+        display(y, port)
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.UPDATE)
+def select_ducky_docs(app: App):
+    box = app.resources.get(ResourceID.SCRIPT_DOCS_BOX)
+
+    char_size = font_size(app, string="m")
+    sel = list(app.resources.get(ResourceID.SCRIPTS).items())[
+        app.resources.get(ResourceID.SCRIPTS_I)][1]
+
+    box_h = box.y_max - box.y_min
+    # mid_horiz = (box.x_max + box.x_min) / 2
+    box_w = box.x_max - box.x_min
+    n_lines = box_h // int(char_size[1] * 1.5) - 1
+    line_h = box_h / n_lines
+    line_len = int(box_w // char_size[0])
+
+    display = partial(draw_text, app, box.x_min)
+
+    printed_lines = 0
+
+    for line in sel.docs:
+        if not line.strip():
+            printed_lines += 1
+            continue
+
+        for lin in textwrap_fill(line, line_len).splitlines(keepends=False):
+            y = box.y_min + (line_h * printed_lines) + (line_h / 2)
+            display(y, lin)
+            printed_lines += 1
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.UPDATE)
+def select_script(app: App):
+    if Buttons.A in app.resources.get(ResourceID.KEY_SCAN):
+        app.set_next_state(States.CONFIRM_SCRIPT)
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.UPDATE)
+def nav_scripts(app: App):
+    scripts = app.resources.get(ResourceID.SCRIPTS)
+    selected = app.resources.get(ResourceID.SCRIPTS_I)
+    # selected = selected if selected else ports[0]
+    # sel_i = ports.index(selected)
+
+    if up_pressed(app):
+        app.resources[ResourceID.SCRIPTS_I] = (selected - 1) % len(scripts)
+    elif down_pressed(app):
+        app.resources[ResourceID.SCRIPTS_I] = (selected + 1) % len(scripts)
+
+
+@app.register(States.SELECT_SCRIPT, Schedule.UPDATE)
+def highlight_script(app: App):
+    selected = list(app.resources.get(ResourceID.SCRIPTS).items())[
+        app.resources.get(ResourceID.SCRIPTS_I)][0]
+    screen = app.resources.get(ResourceID.SCREEN)
+    box = app.resources.get(ResourceID.SCRIPT_NAMES_BOX)
+
+    hl_size = list(font_size(app, string=selected))
+    hl_size[0] += HIGHLIGHT_BORDERS * 2
+    hl_size[1] += HIGHLIGHT_BORDERS
+
+    rect = pygame.Rect((1, 1), hl_size)
+
+    rect.center = ((box.x_min + box.x_max) / 2, SCREEN_HEIGHT / 2)
+
+    pygame.draw.rect(screen, app.resources[ResourceID.HIGHLIGHT_COLOR], rect)
+
+
+@app.register(States.CONFIRM_SCRIPT, Schedule.UPDATE)
+def confirm(app: App):
+    char_size = font_size(app)
+    line_h = char_size[1] * 1.5
+    selected = list(app.resources.get(ResourceID.SCRIPTS).items())[
+        app.resources.get(ResourceID.SCRIPTS_I)][0]
+
+    draw_text(app, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - line_h,
+              "Press the \"A\" button to run script.", center_x=True)
+    draw_text(app, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2,
+              "Press the \"B\" to go back.", center_x=True)
+    draw_text(app, SCREEN_WIDTH / 2, SCREEN_HEIGHT /
+              2 + line_h, F"script =>  {selected}", center_x=True)
+
+
+@app.register(States.CONFIRM_SCRIPT, Schedule.UPDATE)
+def confirm_buttons(app: App):
+    if Buttons.A in app.resources.get(ResourceID.KEY_SCAN):
+        app.set_next_state(States.MONITOR_SCRIPT)
+    elif Buttons.B in app.resources.get(ResourceID.KEY_SCAN):
+        app.set_next_state(States.SELECT_SCRIPT)
+
+
+@app.register(States.MONITOR_SCRIPT, Schedule.ENTER)
+def run_script(app: App):
+    port = app.resources.get(ResourceID.SELECTED_PORT)
+    script_path = list(app.resources.get(ResourceID.SCRIPTS).items())[
+        app.resources.get(ResourceID.SCRIPTS_I)][1].script
+    # print(script_path)
+    executor = DuckyExec(port)
+
+    with open(script_path, "r") as code_f:
+        code = code_f.read()
+        executor.exec_script(code)
+
+    # executor.exec_script(code)
+    app.resources[ResourceID.EXEC] = executor
+    # print("bar")
+
+
+@app.register(States.MONITOR_SCRIPT, Schedule.UPDATE)
+def monitor_script(app: App):
+    executor: DuckyExec = app.resources.get(ResourceID.EXEC)
+    line = executor.step()
+    total = executor.get_total_lines()
+
+    if line is None:
+        app.set_next_state(States.SELECT_COM_PORT)
+        line = total
+
+    percent = line / total
+    length = int(50 * percent)
+    bar = "=" * length
+    bar2 = " " * (50 - length)
+
+    pbar = f"line {line:<3}/{total:<3} [{bar}{bar2}]"
+
+    text_rext = draw_pbar(app, SCREEN_WIDTH / 2, SCREEN_HEIGHT /
+                          2, str(pbar))
+
+
+def clear_screen(app):
+    screen = app.resources.get(ResourceID.SCREEN)
+
+    if screen:
+        screen.fill(app.resources.get(ResourceID.BG_COLOR))
+
+
+def init_screen(app):
+    screen = pygame.display.set_mode(SCREEN_SIZE)
+    app.resources[ResourceID.SCREEN] = screen
+
+
+def init_font(app):
+    pygame.font.init()
+    font = pygame.font.Font(f'{THIS_DIR}/Anonymous Pro.ttf', 30)
+    app.resources[ResourceID.FONT] = font
+
+    font = pygame.font.Font(f'{THIS_DIR}/Anonymous Pro.ttf', 30)
+    app.resources[ResourceID.FONT_2] = font
+
+
+def init_clock(app):
+    clock = pygame.time.Clock()
+    app.resources[ResourceID.CLOCK] = clock
+
+
+def init(app):
+    # pygame.init()
+    app.resources[ResourceID.BG_COLOR] = (0, 0, 0)
+    app.resources[ResourceID.TEXT_COLOR] = (50, 255, 100)
+    app.resources[ResourceID.HIGHLIGHT_COLOR] = (5, 50, 25)
+    app.resources[ResourceID.TO_RENDER] = []
+    app.resources[ResourceID.KEY_SCAN] = []
+    app.resources[ResourceID.LAST_KEY_SCAN] = []
+
+    init_screen(app)
+    init_font(app)
+    init_clock(app)
+
+    clear_screen(app)
+
+
+def render(app):
+    if app.resources[ResourceID.TO_RENDER] and app.resources[ResourceID.SCREEN]:
+        screen = app.resources[ResourceID.SCREEN]
+
+        # for blit_args in app.resources[ResourceID.TO_RENDER]:
+        #     screen.blit(*blit_args)
+
+        renders = app.resources.get(ResourceID.TO_RENDER)
+
+        if renders:
+            # print(renders)
+            [screen.blit(*blit_args) for blit_args in renders]
+
+        app.resources[ResourceID.TO_RENDER] = []
+
+    pygame.display.update()
+
+
+def main():
+    global app
+
+    pygame.init()
+    pygame.joystick.init()
+    joy = None
+    app.resources[ResourceID.PG_EVENTS] = []
+    app.resources[ResourceID.CONTROLLER] = joy
+
+    while app.should_loop():
+        app.resources[ResourceID.PG_EVENTS].clear()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                # print(event)
+                pygame.quit()
+                quit()
+            elif event.type == pygame.JOYDEVICEADDED:
+                joy = pygame.joystick.Joystick(event.device_index)
+                app.resources[ResourceID.CONTROLLER] = joy
+            else:
+                app.resources[ResourceID.PG_EVENTS].append(event)
+
+        clear_screen(app)
+        controls_step(app)
+        app.step()
+        render(app)
+        app.resources[ResourceID.LAST_KEY_SCAN] = deepcopy(
+            app.resources[ResourceID.KEY_SCAN])
+        app.resources[ResourceID.KEY_SCAN].clear()
+        app.resources[ResourceID.CLOCK].tick()
+
+
+if __name__ == "__main__":
+    main()
