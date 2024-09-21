@@ -1,0 +1,5 @@
+ducky-interpreter @ git+https://github.com/calacuda/ducky-interpreter-lib@6b2a145c3f02ff4606ed18e3da17a5d9d27446a7
+esper==3.3
+py_bevy @ git+https://github.com/calacuda/py-bevy@a0eb1c4c1a415a2ad9792d2ba8bfce216acbcef8
+pygame==2.6.0
+wheel==0.44.0
